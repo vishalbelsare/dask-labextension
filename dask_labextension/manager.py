@@ -3,15 +3,15 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 
+import asyncio
 import importlib
 from inspect import isawaitable
 from typing import Any, Dict, List, Union
 from uuid import uuid4
 
 import dask
-from dask.distributed import Adaptive, utils
-from tornado.ioloop import IOLoop
-from tornado.concurrent import Future
+from dask.utils import format_bytes
+from dask.distributed import Adaptive
 
 # A type for a dask cluster model: a serializable
 # representation of information about the cluster.
@@ -59,15 +59,28 @@ class DaskClusterManager:
         self._adaptives: Dict[str, Adaptive] = dict()
         self._cluster_names: Dict[str, str] = dict()
         self._n_clusters = 0
+        self._initialized = None
 
-        self.initialized = Future()
+    async def _async_init(self):
+        """The async part of init
 
-        async def start_clusters():
-            for model in dask.config.get("labextension.initial"):
-                await self.start_cluster(configuration=model)
-            self.initialized.set_result(self)
+        Invoked by `await manager`
+        """
+        for model in dask.config.get("labextension.initial"):
+            await self.start_cluster(configuration=model)
+        return self
 
-        IOLoop.current().add_callback(start_clusters)
+    @property
+    def initialized(self):
+        """Don't create initialization task until it's been requested
+
+        typically via `await manager`
+
+        Makes it easier to ensure we don't do anything before we are in the event loop.
+        """
+        if self._initialized is None:
+            self._initialized = asyncio.create_task(self._async_init())
+        return self._initialized
 
     async def start_cluster(
         self, cluster_id: str = "", configuration: dict = {}
@@ -120,7 +133,9 @@ class DaskClusterManager:
         """
         cluster = self._clusters.get(cluster_id)
         if cluster:
-            await cluster.close()
+            r = cluster.close()
+            if isawaitable(r):
+                await r
             self._clusters.pop(cluster_id)
             name = self._cluster_names.pop(cluster_id)
             adaptive = self._adaptives.pop(cluster_id, None)
@@ -129,7 +144,7 @@ class DaskClusterManager:
         else:
             return None
 
-    def get_cluster(self, cluster_id) -> Union[ClusterModel, None]:
+    async def get_cluster(self, cluster_id) -> Union[ClusterModel, None]:
         """
         Get a Dask cluster model.
 
@@ -150,7 +165,7 @@ class DaskClusterManager:
 
         return make_cluster_model(cluster_id, name, cluster, adaptive)
 
-    def list_clusters(self) -> List[ClusterModel]:
+    async def list_clusters(self) -> List[ClusterModel]:
         """
         List the Dask cluster models known to the manager.
 
@@ -187,7 +202,7 @@ class DaskClusterManager:
             await t
         return make_cluster_model(cluster_id, name, cluster, adaptive=None)
 
-    def adapt_cluster(
+    async def adapt_cluster(
         self, cluster_id: str, minimum: int, maximum: int
     ) -> Union[ClusterModel, None]:
         cluster = self._clusters.get(cluster_id)
@@ -282,17 +297,10 @@ def make_cluster_model(
         scheduler_address=cluster.scheduler_address,
         dashboard_link=cluster.dashboard_link or "",
         workers=len(info["workers"]),
-        memory=utils.format_bytes(
-            sum(d["memory_limit"] for d in info["workers"].values())
-        ),
+        memory=format_bytes(sum(d["memory_limit"] for d in info["workers"].values())),
         cores=cores,
     )
     if adaptive:
         model["adapt"] = {"minimum": adaptive.minimum, "maximum": adaptive.maximum}
 
     return model
-
-
-# Create a default cluster manager
-# to keep track of clusters.
-manager = DaskClusterManager()

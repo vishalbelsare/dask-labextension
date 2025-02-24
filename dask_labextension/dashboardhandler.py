@@ -4,21 +4,31 @@ This proxies the bokeh server http and ws requests through the notebook
 server, preventing CORS issues.
 """
 import json
+from inspect import isawaitable
 from urllib import parse
 
 from tornado import httpclient, web
+
 
 from jupyter_server.base.handlers import APIHandler
 from jupyter_server.utils import url_path_join
 from jupyter_server_proxy.handlers import ProxyHandler
 
-from .manager import manager
+from .manager import DaskClusterManager
 
 
 class DaskDashboardCheckHandler(APIHandler):
     """
     A handler for checking validity of a dask dashboard.
     """
+
+    manager: DaskClusterManager
+
+    async def prepare(self):
+        r = super().prepare()
+        if isawaitable(r):
+            await r
+        self.manager = await self.settings["dask_cluster_manager"]
 
     @web.authenticated
     async def get(self, url) -> None:
@@ -29,6 +39,14 @@ class DaskDashboardCheckHandler(APIHandler):
         try:
             client = httpclient.AsyncHTTPClient()
 
+            # Extract query (if any) from URL, this will then be appended after path.
+            # This allows using (eg) "?token=[...]" in URL for authentication.
+            if "?" in url:
+                pos = url.find("?")
+                url, query = url[:pos], url[pos:]
+            else:
+                query = ""
+
             # First check for the individual-plots endpoint at user-provided url.
             # We don't check for the root URL because that can trigger a lot of
             # object creation in the bokeh document.
@@ -36,7 +54,7 @@ class DaskDashboardCheckHandler(APIHandler):
             effective_url = None
             individual_plots_url = url_path_join(
                 url,
-                "individual-plots.json",
+                f"individual-plots.json{query}",
             )
             try:
                 self.log.debug(
@@ -72,6 +90,14 @@ class DaskDashboardCheckHandler(APIHandler):
                 raise ValueError("Does not seem to host a dask dashboard")
 
             individual_plots = json.loads(individual_plots_response.body)
+
+            # If there was query in original URL, append to URLs returned
+            if query:
+                for name, plot_url in individual_plots.items():
+                    individual_plots[name] = f"{plot_url}{query}"
+                url = f"{url}{query}"
+                if effective_url:
+                    effective_url = f"{effective_url}{query}"
 
             self.set_status(200)
             self.finish(
@@ -117,7 +143,7 @@ class DaskDashboardHandler(ProxyHandler):
         return await self.proxy(cluster_id, proxied_path)
 
     async def open(self, cluster_id, proxied_path):
-        host, port = self._get_parsed(cluster_id)
+        host, port = await self._get_parsed(cluster_id)
         return await super().proxy_open(host, port, proxied_path)
 
     # We have to duplicate all these for now, I've no idea why!
@@ -141,17 +167,17 @@ class DaskDashboardHandler(ProxyHandler):
     def options(self, cluster_id, proxied_path):
         return self.proxy(cluster_id, proxied_path)
 
-    def proxy(self, cluster_id, proxied_path):
-        host, port = self._get_parsed(cluster_id)
+    async def proxy(self, cluster_id, proxied_path):
+        host, port = await self._get_parsed(cluster_id)
         return super().proxy(host, port, proxied_path)
 
-    def _get_parsed(self, cluster_id):
+    async def _get_parsed(self, cluster_id):
         """
         Given a cluster ID, get the hostname and port of its bokeh server.
         """
         # Get the cluster by ID. If it is not found,
         # raise an error.
-        cluster_model = manager.get_cluster(cluster_id)
+        cluster_model = await self.manager.get_cluster(cluster_id)
         if not cluster_model:
             raise web.HTTPError(404, f"Dask cluster {cluster_id} not found")
 
